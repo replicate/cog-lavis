@@ -3,16 +3,438 @@ Requires Transformer 4.28 and above, implementation may change according the Lla
 """
 import logging
 import string
+import time
 from packaging import version
+import subprocess
+import os 
+import asyncio
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
+import torch.distributed as dist
 
+from concurrent.futures import ThreadPoolExecutor
+
+import warnings
 import transformers
 
 from lavis.common.registry import registry
-from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train
+from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train, LayerNorm
+from lavis.models.blip2_models.modeling_llama import LlamaForCausalLM
+
+
+from transformers.generation.logits_process import  LogitsProcessorList
+from transformers.generation.stopping_criteria import StoppingCriteriaList, validate_stopping_criteria
+from transformers.generation.utils import SampleOutput, SampleDecoderOnlyOutput, SampleEncoderDecoderOutput
+
+
+executor = ThreadPoolExecutor(max_workers=10)
+
+def maybe_download(path, output_path):
+    if path.startswith("gs://"):
+        st = time.time()
+        subprocess.check_call(["gcloud", "storage", "cp", path, output_path])
+        print(f"weights at {output_path} downloaded in {time.time() - st}")
+        return output_path
+    return path
+
+class StreamingLlamaForCausalLM(LlamaForCausalLM):
+    """Overriding sample to yield tokens"""
+    def sample(
+            self,
+            input_ids: torch.LongTensor,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            logits_warper: Optional[LogitsProcessorList] = None,
+            max_length: Optional[int] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            output_scores: Optional[bool] = None,
+            return_dict_in_generate: Optional[bool] = None,
+            synced_gpus: Optional[bool] = False,
+            **model_kwargs,
+        ) -> Union[SampleOutput, torch.LongTensor]:
+            r"""
+            Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
+            can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
+
+            <Tip warning={true}>
+
+            In most cases, you do not need to call [`~generation.GenerationMixin.sample`] directly. Use generate() instead.
+            For an overview of generation strategies and code examples, check the [following
+            guide](./generation_strategies).
+
+            </Tip>
+
+            Parameters:
+                input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                    The sequence used as a prompt for the generation.
+                logits_processor (`LogitsProcessorList`, *optional*):
+                    An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
+                    used to modify the prediction scores of the language modeling head applied at each generation step.
+                stopping_criteria (`StoppingCriteriaList`, *optional*):
+                    An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
+                    used to tell if the generation loop should stop.
+                logits_warper (`LogitsProcessorList`, *optional*):
+                    An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsWarper`] used
+                    to warp the prediction score distribution of the language modeling head applied before multinomial
+                    sampling at each generation step.
+                max_length (`int`, *optional*, defaults to 20):
+                    **DEPRECATED**. Use `logits_processor` or `stopping_criteria` directly to cap the number of generated
+                    tokens. The maximum length of the sequence to be generated.
+                pad_token_id (`int`, *optional*):
+                    The id of the *padding* token.
+                eos_token_id (`int`, *optional*):
+                    The id of the *end-of-sequence* token.
+                output_attentions (`bool`, *optional*, defaults to `False`):
+                    Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                    returned tensors for more details.
+                output_hidden_states (`bool`, *optional*, defaults to `False`):
+                    Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
+                    for more details.
+                output_scores (`bool`, *optional*, defaults to `False`):
+                    Whether or not to return the prediction scores. See `scores` under returned tensors for more details.
+                return_dict_in_generate (`bool`, *optional*, defaults to `False`):
+                    Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+                synced_gpus (`bool`, *optional*, defaults to `False`):
+                    Whether to continue running the while loop until max_length (needed for ZeRO stage 3)
+                model_kwargs:
+                    Additional model specific kwargs will be forwarded to the `forward` function of the model. If model is
+                    an encoder-decoder model the kwargs should include `encoder_outputs`.
+
+            Return:
+                [`~generation.SampleDecoderOnlyOutput`], [`~generation.SampleEncoderDecoderOutput`] or `torch.LongTensor`:
+                A `torch.LongTensor` containing the generated tokens (default behaviour) or a
+                [`~generation.SampleDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
+                `return_dict_in_generate=True` or a [`~generation.SampleEncoderDecoderOutput`] if
+                `model.config.is_encoder_decoder=True`.
+
+            Examples:
+
+            ```python
+            >>> from transformers import (
+            ...     AutoTokenizer,
+            ...     AutoModelForCausalLM,
+            ...     LogitsProcessorList,
+            ...     MinLengthLogitsProcessor,
+            ...     TopKLogitsWarper,
+            ...     TemperatureLogitsWarper,
+            ...     StoppingCriteriaList,
+            ...     MaxLengthCriteria,
+            ... )
+            >>> import torch
+
+            >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            >>> model = AutoModelForCausalLM.from_pretrained("gpt2")
+
+            >>> # set pad_token_id to eos_token_id because GPT2 does not have a EOS token
+            >>> model.config.pad_token_id = model.config.eos_token_id
+            >>> model.generation_config.pad_token_id = model.config.eos_token_id
+
+            >>> input_prompt = "Today is a beautiful day, and"
+            >>> input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
+
+            >>> # instantiate logits processors
+            >>> logits_processor = LogitsProcessorList(
+            ...     [
+            ...         MinLengthLogitsProcessor(15, eos_token_id=model.generation_config.eos_token_id),
+            ...     ]
+            ... )
+            >>> # instantiate logits processors
+            >>> logits_warper = LogitsProcessorList(
+            ...     [
+            ...         TopKLogitsWarper(50),
+            ...         TemperatureLogitsWarper(0.7),
+            ...     ]
+            ... )
+
+            >>> stopping_criteria = StoppingCriteriaList([MaxLengthCriteria(max_length=20)])
+
+            >>> torch.manual_seed(0)  # doctest: +IGNORE_RESULT
+            >>> outputs = model.sample(
+            ...     input_ids,
+            ...     logits_processor=logits_processor,
+            ...     logits_warper=logits_warper,
+            ...     stopping_criteria=stopping_criteria,
+            ... )
+
+            >>> tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            ['Today is a beautiful day, and a wonderful day.\n\nI was lucky enough to meet the']
+            ```"""
+            # init values
+            logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+            stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+            if max_length is not None:
+                warnings.warn(
+                    "`max_length` is deprecated in this function, use"
+                    " `stopping_criteria=StoppingCriteriaList(MaxLengthCriteria(max_length=max_length))` instead.",
+                    UserWarning,
+                )
+                stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
+            logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+            pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+            eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+            if isinstance(eos_token_id, int):
+                eos_token_id = [eos_token_id]
+            output_scores = output_scores if output_scores is not None else self.generation_config.output_scores
+            output_attentions = (
+                output_attentions if output_attentions is not None else self.generation_config.output_attentions
+            )
+            output_hidden_states = (
+                output_hidden_states if output_hidden_states is not None else self.generation_config.output_hidden_states
+            )
+            return_dict_in_generate = (
+                return_dict_in_generate
+                if return_dict_in_generate is not None
+                else self.generation_config.return_dict_in_generate
+            )
+
+            # init attention / hidden states / scores tuples
+            scores = () if (return_dict_in_generate and output_scores) else None
+            decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
+            cross_attentions = () if (return_dict_in_generate and output_attentions) else None
+            decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
+
+            # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+            if return_dict_in_generate and self.config.is_encoder_decoder:
+                encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
+                encoder_hidden_states = (
+                    model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
+                )
+
+            # keep track of which sequences are already finished
+            unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
+
+            this_peer_finished = False  # used by synced_gpus only
+            # auto-regressive generation
+            while True:
+                if synced_gpus:
+                    # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
+                    # The following logic allows an early break if all peers finished generating their sequence
+                    this_peer_finished_flag = torch.tensor(0.0 if this_peer_finished else 1.0).to(input_ids.device)
+                    # send 0.0 if we finished, 1.0 otherwise
+                    dist.all_reduce(this_peer_finished_flag, op=dist.ReduceOp.SUM)
+                    # did all peers finish? the reduced sum will be 0.0 then
+                    if this_peer_finished_flag.item() == 0.0:
+                        break
+
+                # prepare model inputs
+                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+
+                # forward pass to get next token
+                outputs = self(
+                    **model_inputs,
+                    return_dict=True,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                )
+
+                if synced_gpus and this_peer_finished:
+                    continue  # don't waste resources running the code we don't need
+
+                next_token_logits = outputs.logits[:, -1, :]
+
+                # pre-process distribution
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+                next_token_scores = logits_warper(input_ids, next_token_scores)
+
+                # Store scores, attentions and hidden_states when required
+                if return_dict_in_generate:
+                    if output_scores:
+                        scores += (next_token_scores,)
+                    if output_attentions:
+                        decoder_attentions += (
+                            (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
+                        )
+                        if self.config.is_encoder_decoder:
+                            cross_attentions += (outputs.cross_attentions,)
+
+                    if output_hidden_states:
+                        decoder_hidden_states += (
+                            (outputs.decoder_hidden_states,)
+                            if self.config.is_encoder_decoder
+                            else (outputs.hidden_states,)
+                        )
+
+                # sample
+                probs = nn.functional.softmax(next_token_scores, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+
+                # finished sentences should have their next token be a padding token
+                if eos_token_id is not None:
+                    if pad_token_id is None:
+                        raise ValueError("If `eos_token_id` is defined, make sure that `pad_token_id` is defined.")
+                    next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+
+                # update generated ids, model inputs, and length for next step
+                input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+                model_kwargs = self._update_model_kwargs_for_generation(
+                    outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
+                )
+
+                # if eos_token was found in one sentence, set sentence to finished
+                if eos_token_id is not None:
+                    unfinished_sequences = unfinished_sequences.mul((sum(next_tokens != i for i in eos_token_id)).long())
+
+                # stop when each sentence is finished, or if we exceed the maximum length
+                if unfinished_sequences.max() == 0 or stopping_criteria(input_ids, scores):
+                    if not synced_gpus:
+                        break
+                    else:
+                        this_peer_finished = True
+                else:
+                    yield next_tokens
+
+            if return_dict_in_generate:
+                if self.config.is_encoder_decoder:
+                    yield SampleEncoderDecoderOutput(
+                        sequences=input_ids,
+                        scores=scores,
+                        encoder_attentions=encoder_attentions,
+                        encoder_hidden_states=encoder_hidden_states,
+                        decoder_attentions=decoder_attentions,
+                        cross_attentions=cross_attentions,
+                        decoder_hidden_states=decoder_hidden_states,
+                    )
+                else:
+                    yield SampleDecoderOnlyOutput(
+                        sequences=input_ids,
+                        scores=scores,
+                        attentions=decoder_attentions,
+                        hidden_states=decoder_hidden_states,
+                    )
+            else:
+                yield next_tokens
+
+async def load_tensorized_model(weights, config_path, cls, output_path):
+    loop = asyncio.get_event_loop()
+    model = await loop.run_in_executor(
+        executor, 
+        _load_tensorized_model, 
+        weights, config_path, cls, output_path
+    )
+    return model
+
+
+def _load_tensorized_model(weights, config_path, cls, output_path):
+    from tensorizer import TensorDeserializer
+    from tensorizer.utils import no_init_or_tensor
+    from transformers import AutoConfig
+
+    weights = maybe_download(weights, output_path = output_path)
+
+    print(f"deserializing llm weights...")
+
+    st = time.time()
+
+    # Load model config
+    config = AutoConfig.from_pretrained(config_path)
+
+    with no_init_or_tensor():
+        model = cls(
+            config, 
+        )
+    
+    deserializer = TensorDeserializer(weights, plaid_mode=True)
+    deserializer.load_into_module(model)
+
+    print(f"llm weights loaded in {time.time() - st}")
+    model.eval()
+    return model
+
+async def load_vit_model(path, output_path):
+    loop = asyncio.get_event_loop()
+    model = await loop.run_in_executor(
+        executor, 
+        _load_vit_model, 
+        path,
+        output_path
+    )
+    return model
+
+def _load_vit_model(path="model/vision_encoder.pt", output_path="model/vision_encoder.pt"):
+        local_path = maybe_download(path, output_path=output_path)
+        visual_encoder = torch.load(local_path)
+        ln_vision = LayerNorm(visual_encoder.num_features)
+        return visual_encoder, ln_vision
+
+
+def _load_qformer_model(path="model/qformer.pt", output_path="model/vision_encoder.pt"):
+    local_path = maybe_download(path, output_path=output_path)
+    Qformer = torch.load(local_path)
+    return Qformer
+
+
+async def load_qformer_model(path, output_path):
+    loop = asyncio.get_event_loop()
+    model = await loop.run_in_executor(
+        executor, 
+        _load_qformer_model, 
+        path,
+        output_path
+    )
+    return model
+
+def _load_query_tokens(path="model/query_tokens.pt", output_path="model/query_tokens.pt"):
+    local_path = maybe_download(path, output_path=output_path)
+    query_tokens = torch.load(local_path)
+    return query_tokens
+
+async def load_query_tokens(path, output_path):
+    loop = asyncio.get_event_loop()
+    model = await loop.run_in_executor(
+        executor, 
+        _load_query_tokens, 
+        path,
+        output_path
+    )
+    return model
+
+def _download_pretrained_checkpoint(path="model/pretrained_checkpoint.pt", output_path="model/pretrained_checkpoint.pt"):
+    local_path = maybe_download(path, output_path=output_path)
+    return local_path
+
+async def download_pretrained_checkpoint(path, output_path):
+    loop = asyncio.get_event_loop()
+    local_path = await loop.run_in_executor(
+        executor, 
+        _download_pretrained_checkpoint, 
+        path,
+        output_path
+    )
+    return local_path
+
+async def load_models(llm_weights, llm_config_path, llm_cls, vit_path, qformer_path, query_tokens_path, pretrained_checkpoint_path):
+    task1 = load_tensorized_model(llm_weights, llm_config_path, llm_cls, output_path="model/llm_model.pt")
+    task2 = load_vit_model(vit_path, output_path="model/vision_encoder.pt")
+    task3 = load_qformer_model(qformer_path, output_path="model/qformer.pt")
+    task4 = load_query_tokens(query_tokens_path, output_path="model/query_tokens.pt")
+    task5 = download_pretrained_checkpoint(pretrained_checkpoint_path, output_path="model/pretrained_checkpoint.pt")
+    models = await asyncio.gather(task1, task2, task3, task4, task5)
+    return models
+
+
+async def main(
+        llm_weights="./model/vicuna-13b-16fp.tensors",
+        llm_config_path="./model/",
+        llm_cls=StreamingLlamaForCausalLM,
+        # llm_cls=LlamaForCausalLM,
+        vit_path="./model/vision_encoder.pt",
+        qformer_path="./model/qformer.pt",
+        query_tokens_path="./model/query_tokens.pt",
+        pretrained_checkpoint_path="./model/pretrained_checkpoint.pt",
+):
+
+    models = await load_models(llm_weights, llm_config_path, llm_cls, vit_path, qformer_path, query_tokens_path, pretrained_checkpoint_path)
+    llm_model = models[0]
+    vit_model, ln_vision = models[1]
+    Qformer = models[2]
+    query_tokens = models[3]
+    return llm_model, vit_model, ln_vision, Qformer, query_tokens
 
 @registry.register_model("blip2_vicuna_instruct")
 class Blip2VicunaInstruct(Blip2Base):
@@ -47,17 +469,76 @@ class Blip2VicunaInstruct(Blip2Base):
         apply_lemmatizer=False,
         qformer_text_input=True,
     ):
+            
         super().__init__()
         transformers_version = version.parse(transformers.__version__)
         assert transformers_version >= version.parse("4.28"), "BLIP-2 Vicuna requires transformers>=4.28"        
-        from transformers import LlamaTokenizer
+        from transformers import LlamaTokenizer, BertTokenizer
         from lavis.models.blip2_models.modeling_llama import LlamaForCausalLM
         
-        self.tokenizer = self.init_tokenizer(truncation_side="left")
+        # Assume we are working with a local cache of all required model files
+        if llm_model.endswith(".tensors"):
+            tensorized_weights = llm_model
+            # get parent directory of llm_model file
+            llm_model = "/".join(llm_model.split("/")[:-1])
+            st = time.time()
 
-        self.visual_encoder, self.ln_vision = self.init_vision_encoder(
-            vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
-        )
+
+            
+            model_paths = dict(
+                llm_weights="gs://replicate-weights/blip2-instruct-vicuna13b/vicuna-13b-16fp.tensors",
+                llm_config_path="./model/",
+                llm_cls=StreamingLlamaForCausalLM,
+                vit_path="gs://replicate-weights/blip2-instruct-vicuna13b/vision_encoder.pt",
+                qformer_path="gs://replicate-weights/blip2-instruct-vicuna13b/qformer.pt",
+                query_tokens_path="gs://replicate-weights/blip2-instruct-vicuna13b/query_tokens.pt",
+                pretrained_checkpoint_path="gs://replicate-weights/blip2-instruct-vicuna13b/pretrained_checkpoint.pt",
+            )
+
+            self.llm_model, self.visual_encoder, self.ln_vision, self.Qformer, self.query_tokens = asyncio.run(main(**model_paths))
+            
+            # self.llm_model, self.visual_encoder, self.ln_vision, self.Qformer, self.query_tokens = asyncio.run(main())
+
+            self.tokenizer = BertTokenizer.from_pretrained('./model/bert-base-uncased')
+            print(f"Time to download weights and load models: {time.time() - st}")
+
+        else:
+            tensorized_weights = None
+            self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+                vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+            )
+
+            self.llm_model = LlamaForCausalLM.from_pretrained(
+                llm_model, torch_dtype=torch.float16
+            )
+
+            st = time.time()
+            print("Initializing Qformer...")
+            self.Qformer, self.query_tokens = self.init_Qformer(
+                num_query_token, self.visual_encoder.num_features
+            )
+            print(f"Qformer initialized in {time.time() - st}")
+
+            st = time.time()
+            self.tokenizer = self.init_tokenizer(truncation_side="left")
+            print(f"tokenizer initialized in {time.time() - st}")
+
+
+
+        # print("Initializing vision encoder...")
+        # st = time.time()
+        # if os.path.isfile("model/vision_encoder.pth"):
+        #     initialized_vit_model = "model/vision_encoder.pth"
+        #     initialized_vit_model = maybe_download(initialized_vit_model)
+        #     self.visual_encoder = torch.load(initialized_vit_model)
+        #     self.ln_vision = LayerNorm(self.visual_encoder.num_features)
+
+        # else:
+        #     self.visual_encoder, self.ln_vision = self.init_vision_encoder(
+        #         vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
+        #     )
+        # print(f"vision encoder initialized in {time.time() - st}")
+
         if freeze_vit:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
@@ -65,24 +546,36 @@ class Blip2VicunaInstruct(Blip2Base):
             self.visual_encoder.train = disabled_train
             logging.info("freeze vision encoder")
 
-        self.Qformer, self.query_tokens = self.init_Qformer(
-            num_query_token, self.visual_encoder.num_features
-        )
 
         if not qformer_text_input:
+            st = time.time()
+
             self.Qformer.bert.embeddings.word_embeddings = None
             self.Qformer.bert.embeddings.position_embeddings = None
             for layer in self.Qformer.bert.encoder.layer:
                 layer.output = None
                 layer.intermediate = None
+            print(f"freeze Qformer in {time.time() - st}")
         else:
             self.Qformer.resize_token_embeddings(len(self.tokenizer))
         self.Qformer.cls = None
 
+
         self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False, truncation_side="left")
-        self.llm_model = LlamaForCausalLM.from_pretrained(
-            llm_model, torch_dtype=torch.float16
-        )
+
+        # print("Initializing LLM...")
+        # st = time.time()
+        # if tensorized_weights:
+        #     self.llm_model = load_tensorized_model(tensorized_weights, llm_model, LlamaForCausalLM)
+            
+        # else:
+
+        #     self.llm_model = LlamaForCausalLM.from_pretrained(
+        #         llm_model, torch_dtype=torch.float16
+        # )
+        # print(f"LLM initialized in {time.time() - st}")
+
+
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
         self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
@@ -90,7 +583,6 @@ class Blip2VicunaInstruct(Blip2Base):
         # self.llm_tokenizer.pad_token = self.llm_tokenizer.unk_token
 
         self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
-
         # self.eos_token_id = self.llm_tokenizer(
         #     self.llm_tokenizer.eos_token, add_special_tokens=False
         # ).input_ids[0]
@@ -242,7 +734,7 @@ class Blip2VicunaInstruct(Blip2Base):
         self,
         samples,
         use_nucleus_sampling=False,
-        num_beams=5,
+        num_beams=1,
         max_length=256,
         min_length=1,
         top_p=0.9,
@@ -250,7 +742,9 @@ class Blip2VicunaInstruct(Blip2Base):
         length_penalty=1,
         num_captions=1,
         temperature=1,
+        **generate_kwargs,
     ):
+        
         self.llm_tokenizer.padding_side = "left"
 
         if "prompt" in samples.keys():
@@ -353,11 +847,10 @@ class Blip2VicunaInstruct(Blip2Base):
             inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
             inputs_embeds = torch.cat([inputs_llm, inputs_embeds], dim=1)
             attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
-
-            outputs = self.llm_model.generate(
+            for output in self.llm_model.generate(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
-                do_sample=use_nucleus_sampling,
+                # do_sample=use_nucleus_sampling,
                 top_p=top_p,
                 temperature=temperature,
                 num_beams=num_beams,
@@ -367,13 +860,31 @@ class Blip2VicunaInstruct(Blip2Base):
                 repetition_penalty=repetition_penalty,
                 length_penalty=length_penalty,
                 num_return_sequences=num_captions,
-            )
+                # do_sample=True,
+                **generate_kwargs,
+            ):
+                yield output
+        #     outputs = self.llm_model.generate(
+        #         inputs_embeds=inputs_embeds,
+        #         attention_mask=attention_mask,
+        #         # do_sample=use_nucleus_sampling,
+        #         top_p=top_p,
+        #         temperature=temperature,
+        #         num_beams=num_beams,
+        #         max_length=max_length,
+        #         min_length=min_length,
+        #         # eos_token_id=self.eos_token_id,
+        #         repetition_penalty=repetition_penalty,
+        #         length_penalty=length_penalty,
+        #         num_return_sequences=num_captions,
+        #         **generate_kwargs,
+        #     )
 
-        outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
-        output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        output_text = [text.strip() for text in output_text]
-
-        return output_text
+        # outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
+        # output_text = self.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        # output_text = [text.strip() for text in output_text]
+        # print(output_text)
+        # return output_text
 
     def predict_answers(
         self,
@@ -725,7 +1236,6 @@ class Blip2VicunaInstruct(Blip2Base):
         #     model.load_from_pretrained(
         #         url_or_filename="https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/blip2_pretrained.pth"
         #     )
-
         model.load_checkpoint_from_config(cfg)
 
         return model

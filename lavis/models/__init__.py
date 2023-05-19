@@ -89,6 +89,40 @@ __all__ = [
 ]
 
 
+def load_tensorized_model(name, model_type, is_eval=False, device="cpu", checkpoint=None):
+    """
+    Load supported models.
+
+    To list all available models and types in registry:
+    >>> from lavis.models import model_zoo
+    >>> print(model_zoo)
+
+    Args:
+        name (str): name of the model.
+        model_type (str): type of the model.
+        is_eval (bool): whether the model is in eval mode. Default: False.
+        device (str): device to use. Default: "cpu".
+        checkpoint (str): path or to checkpoint. Default: None.
+            Note that expecting the checkpoint to have the same keys in state_dict as the model.
+
+    Returns:
+        model (torch.nn.Module): model.
+    """
+
+    model = registry.get_model_class(name).from_pretrained(model_type=model_type)
+
+    if checkpoint is not None:
+        model.load_checkpoint(checkpoint)
+
+    if is_eval:
+        model.eval()
+
+    if device == "cpu":
+        model = model.float()
+
+    return model.to(device)
+
+
 def load_model(name, model_type, is_eval=False, device="cpu", checkpoint=None):
     """
     Load supported models.
@@ -192,13 +226,12 @@ def load_model_and_preprocess(name, model_type, is_eval=False, device="cpu"):
     Returns:
         model (torch.nn.Module): model.
         vis_processors (dict): preprocessors for visual inputs.
-        txt_processors (dict): preprocessors for text inputs.
+        txt_processors (dict): preprocmodel, vis_processors, _ = load_model_and_preprocess(name="blip2_vicuna_instruct", model_type="vicuna7b", is_eval=True, device=device)
+essors for text inputs.
     """
     model_cls = registry.get_model_class(name)
-
     # load model
     model = model_cls.from_pretrained(model_type=model_type)
-
     if is_eval:
         model.eval()
 
@@ -206,7 +239,6 @@ def load_model_and_preprocess(name, model_type, is_eval=False, device="cpu"):
     cfg = OmegaConf.load(model_cls.default_config_path(model_type))
     if cfg is not None:
         preprocess_cfg = cfg.preprocess
-
         vis_processors, txt_processors = load_preprocess(preprocess_cfg)
     else:
         vis_processors, txt_processors = None, None
